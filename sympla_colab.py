@@ -299,16 +299,19 @@ def parse_event(jsonld: dict, source_url: str) -> Fact:
 # Стадия 2b — HTML-фоллбэк (только то, что лежит в стандартных мета-тегах)
 # -----------------------------------------------------------------------------
 # Принцип фоллбэка: JSON-LD неполный? Дозабираем ТОЛЬКО надёжные, машинно-
-# размеченные сигналы (OpenGraph/Twitter/meta + canonical) и явное «бесплатно».
-# Даты/адрес из произвольного текста НЕ выдумываем — пусть остаются None, тогда
-# стадия 5 честно пометит запись «требует проверки». Это уважает принцип
+# размеченные сигналы (OpenGraph/Twitter/meta + canonical).
+# Даты/адрес/цену из произвольного текста НЕ выдумываем — пусть остаются None,
+# тогда стадия 5 честно пометит запись «требует проверки». Это уважает принцип
 # «факты приносит только детерминированный код, без догадок».
+#
+# ВАЖНО: бесплатность по слову «grátis» в тексте страницы НЕ определяем —
+# это слово есть в навигации самого Sympla («Criar evento grátis») на каждой
+# странице и ложно метило ВСЕ события бесплатными. is_free берём только из
+# структурированных offers JSON-LD.
 #
 # TODO[live]: egress к sympla.com.br в этой среде закрыт политикой прокси (403),
 # поэтому Sympla-специфичные CSS-селекторы карточки нельзя подтвердить вживую.
 # Когда доступ появится — добавить сюда точечные селекторы даты/адреса/цены.
-
-_FREE_RE = re.compile(r"\b(gratuito|grátis|gratis|entrada\s+franca|free)\b", re.I)
 
 
 def parse_html_fallback(html_text: str, source_url: str, base: Optional[Fact] = None) -> Fact:
@@ -337,12 +340,6 @@ def parse_html_fallback(html_text: str, source_url: str, base: Optional[Fact] = 
             ("name", "twitter:description"),
             ("name", "description"),
         )
-
-    # явная бесплатность — надёжный сигнал на бразильских страницах
-    if f.is_free is None and f.price is None:
-        text = soup.get_text(" ", strip=True)
-        if _FREE_RE.search(text):
-            f.price, f.is_free = 0.0, True
 
     # canonical как запасной source_url (исходный URL всё равно приоритетен)
     if not f.source_url:
@@ -631,11 +628,13 @@ def selftest() -> int:
     check(f.category == "Детские события", f"cat={f.category}")
     check(f.status != "требует проверки" and not f._issues, f"status={f.status} issues={f._issues}")
 
-    # 2) HTML-фоллбэк дозабирает пустые поля (описание из og, бесплатность из текста)
+    # 2) HTML-фоллбэк дозабирает описание из og, но НЕ выдумывает бесплатность из
+    #    текста: слово «Gratuito» в теле страницы (или в навигации Sympla) НЕ должно
+    #    помечать событие бесплатным — is_free остаётся None без offers JSON-LD.
     f2 = process_html(_FIXTURE_PARTIAL, "https://www.sympla.com.br/oficina__2222",
                       use_llm=False, check_url=False)
     check(f2.description == "Workshop gratuito de desenho, 6+", f"desc={f2.description!r}")
-    check(f2.is_free is True and f2.price == 0.0, f"free={f2.is_free} price={f2.price}")
+    check(f2.is_free is None and f2.price is None, f"free={f2.is_free} price={f2.price}")
     check(f2.category == "Мастер-классы", f"cat2={f2.category}")
 
     # 3) глухая страница без JSON-LD и без мета -> требует проверки
