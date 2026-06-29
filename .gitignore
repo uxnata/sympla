@@ -1,0 +1,15 @@
+# secrets — never commit (CLAUDE.md)
+.env
+*.env
+**/secrets*
+
+# output artifacts
+facts.json
+*.out.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
