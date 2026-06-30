@@ -260,6 +260,85 @@ def parse_event(jsonld: dict, source_url: str) -> Fact:
 
 
 # -----------------------------------------------------------------------------
+# Стадия 2a — __NEXT_DATA__ (основной источник Sympla: сайт на Next.js, JSON-LD нет)
+# -----------------------------------------------------------------------------
+# Все факты события лежат в JSON, который страница отдаёт в
+# <script id="__NEXT_DATA__">. Путь до события:
+#   props.pageProps.hydrationData.eventHydration.event
+# Это детерминированный разбор данных, которые сам сайт встроил в страницу —
+# принцип «факты только из кода» соблюдён. Цены в объекте event нет (билеты
+# грузятся отдельным запросом) → price/is_free оставляем None, не выдумываем.
+
+def _next_data(html_text: str) -> Optional[dict]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if not tag:
+        return None
+    raw = tag.string or tag.get_text() or ""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _event_from_next(data: dict) -> Optional[dict]:
+    try:
+        ev = data["props"]["pageProps"]["hydrationData"]["eventHydration"]["event"]
+    except (KeyError, TypeError):
+        return None
+    return ev if isinstance(ev, dict) else None
+
+
+def parse_next_data(html_text: str, source_url: str) -> Optional[Fact]:
+    """Извлечь факт события из __NEXT_DATA__ Sympla. None — если структуры нет."""
+    data = _next_data(html_text)
+    if not data:
+        return None
+    ev = _event_from_next(data)
+    if ev is None:
+        return None
+
+    f = Fact(source_url=source_url)
+    f.title = _clean(ev.get("name"))
+
+    # описание: strippedDetail (чистый текст) предпочтительнее detail (HTML)
+    desc = ev.get("strippedDetail") or ev.get("detail")
+    if desc and "<" in str(desc):
+        desc = BeautifulSoup(str(desc), "html.parser").get_text(" ", strip=True)
+    f.description = _clean(desc)
+
+    # даты: ISO8601 из *MultiFormat надёжнее, иначе сырые startDate/endDate
+    sd = (ev.get("startDateMultiFormat") or {}).get("ISO8601") or ev.get("startDate")
+    ed = (ev.get("endDateMultiFormat") or {}).get("ISO8601") or ev.get("endDate")
+    f.start_date, f.start_time = _split_dt(sd)
+    f.end_date, f.end_time = _split_dt(ed)
+
+    # адрес (структурированный)
+    addr = ev.get("eventsAddress")
+    if isinstance(addr, dict):
+        street, num = addr.get("address"), addr.get("addressNum")
+        line = f"{street}, {num}" if street and num else street
+        city_state = " - ".join(p for p in [addr.get("city"), addr.get("state")] if p)
+        parts = [addr.get("name"), line, addr.get("neighborhood"), city_state]
+        f.address = ", ".join(p for p in parts if p) or None
+        f.city = _clean(addr.get("city"))
+        f.district = _clean(addr.get("neighborhood"))
+
+    # формат: есть onlineInfo -> online, иначе offline
+    f.format = "online" if ev.get("onlineInfo") else "offline"
+
+    # сырьё категории Sympla -> попадёт в hay для _map_category
+    cat = ev.get("eventsCategory")
+    if isinstance(cat, dict):
+        f.category = _clean(cat.get("description") or cat.get("name"))
+
+    # отмена
+    if ev.get("cancelled"):
+        f.status = "отменено"
+    return f
+
+
+# -----------------------------------------------------------------------------
 # Стадия 2b — HTML-фоллбэк (только то, что лежит в стандартных мета-тегах)
 # -----------------------------------------------------------------------------
 # Принцип фоллбэка: JSON-LD неполный? Дозабираем ТОЛЬКО надёжные, машинно-
@@ -432,15 +511,22 @@ def process_one(url: str, use_llm: bool = True, check_url: bool = True) -> Fact:
 
 
 def process_html(html_text: str, url: str, use_llm: bool = True, check_url: bool = True) -> Fact:
-    """Стадии 2..5 над уже скачанным HTML (вынесено ради оффлайн-тестов)."""
+    """Стадии 2..5 над уже скачанным HTML (вынесено ради оффлайн-тестов).
+
+    Источники по приоритету: JSON-LD (schema.org) -> __NEXT_DATA__ (основной для
+    Sympla) -> OpenGraph/meta-фоллбэк дозабирает оставшиеся пустые поля.
+    """
     events = extract_jsonld_events(html_text)
-    f = parse_event(events[0], url) if events else Fact(source_url=url)
-    # HTML-фоллбэк всегда дозабирает пустые поля; при отсутствии JSON-LD — единственный источник
+    if events:
+        f = parse_event(events[0], url)
+    else:
+        f = parse_next_data(html_text, url) or Fact(source_url=url)
+    # HTML-фоллбэк всегда дозабирает пустые поля
     f = parse_html_fallback(html_text, url, base=f)
-    if not events and not f.title:
-        # совсем глухая страница: ни JSON-LD, ни мета — нечего классифицировать
+    if not f.title:
+        # ни JSON-LD, ни __NEXT_DATA__, ни мета — нечего классифицировать
         f.status = "требует проверки"
-        f._issues.append("no_jsonld")
+        f._issues.append("no_data")
         return f
     f.category = _map_category(f)
     enrich = enrich_with_llm(f) if use_llm else {}
@@ -568,6 +654,21 @@ _FIXTURE_LISTING = """<html><body>
 <a href="https://outrosite.com/evento/abc/9">other-domain</a>
 </body></html>"""
 
+# Sympla-страница: JSON-LD нет, всё в __NEXT_DATA__ (как на реальном сайте)
+_FIXTURE_NEXT = """<html><head>
+<script id="__NEXT_DATA__" type="application/json">
+{"props":{"pageProps":{"hydrationData":{"eventHydration":{"event":{
+ "name":"Colônia de Férias | Clube Regatas | Inverno 2026",
+ "strippedDetail":"Para crianças de 5 a 12 anos. Muita diversão e natureza.",
+ "startDate":"2026-07-06 08:00:00",
+ "startDateMultiFormat":{"ISO8601":"2026-07-06T08:00:00-03:00"},
+ "endDateMultiFormat":{"ISO8601":"2026-07-17T17:00:00-03:00"},
+ "eventsAddress":{"name":"Clube Campineiro de Regatas","address":"Av. Coronel Silva Telles","addressNum":"462","neighborhood":"Cambuí","city":"Campinas","state":"SP"},
+ "onlineInfo":null,
+ "eventsCategory":{"name":"infantil","description":"Infantil"},
+ "cancelled":false}}}}}}
+</script></head><body></body></html>"""
+
 
 def selftest() -> int:
     fails: list[str] = []
@@ -600,10 +701,27 @@ def selftest() -> int:
     check(f2.is_free is None and f2.price is None, f"free={f2.is_free} price={f2.price}")
     check(f2.category == "Мастер-классы", f"cat2={f2.category}")
 
-    # 3) глухая страница без JSON-LD и без мета -> требует проверки
+    # 3) глухая страница без JSON-LD/__NEXT_DATA__/мета -> требует проверки
     f3 = process_html("<html><body>nada</body></html>", "https://x/y",
                       use_llm=False, check_url=False)
-    check(f3.status == "требует проверки" and "no_jsonld" in f3._issues, f"empty={f3.status} {f3._issues}")
+    check(f3.status == "требует проверки" and "no_data" in f3._issues, f"empty={f3.status} {f3._issues}")
+
+    # 3b) Sympla __NEXT_DATA__ путь: дата+адрес берутся из встроенного JSON
+    fn = process_html(_FIXTURE_NEXT, "https://www.sympla.com.br/evento/colonia/3426870",
+                      use_llm=False, check_url=False)
+    check(fn.start_date == "2026-07-06" and fn.start_time == "08:00", f"next dt={fn.start_date} {fn.start_time}")
+    check(fn.end_date == "2026-07-17", f"next end={fn.end_date}")
+    check(fn.city == "Campinas" and fn.district == "Cambuí", f"next city/distr={fn.city}/{fn.district}")
+    check(fn.address and "Av. Coronel Silva Telles, 462" in fn.address, f"next addr={fn.address}")
+    check(fn.format == "offline", f"next format={fn.format}")
+    check(fn.category == "Детские события", f"next cat={fn.category}")
+    check("missing:start_date" not in fn._issues, f"next issues={fn._issues}")
+
+    # 3c) отменённое событие из __NEXT_DATA__
+    fc = process_html(_FIXTURE_NEXT.replace('"cancelled":false', '"cancelled":true'),
+                      "https://www.sympla.com.br/evento/colonia/3426870",
+                      use_llm=False, check_url=False)
+    check(fc.status == "отменено", f"next cancelled={fc.status}")
 
     # 4) discovery-парсер ссылок: дедуп, абсолютизация, отсев чужого домена/листинга
     links = _extract_event_links(_FIXTURE_LISTING)
@@ -630,7 +748,7 @@ def selftest() -> int:
         for m in fails:
             print("  -", m)
         return 1
-    print("SELFTEST: OK (6 групп проверок пройдено)")
+    print("SELFTEST: OK (все группы проверок пройдены)")
     return 0
 
 
