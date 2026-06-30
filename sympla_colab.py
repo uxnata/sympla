@@ -5,9 +5,10 @@ Sympla kids/family events — единый скрипт для Google Colab.
 
 Просто запусти этот файл в Colab (ячейка `%run sympla_colab.py` или кнопка ▶).
 Он сам: поставит зависимости, возьмёт ANTHROPIC_API_KEY из Colab Secrets (🔑),
-соберёт ссылки событий, распарсит JSON-LD, доразметит LLM и сохранит facts.json.
+соберёт события São Paulo и др. через search-API Sympla, заполнит схему и
+сохранит facts.json (LLM-классификация — опционально, при наличии ключа).
 
-Правь блок CONFIG ниже под нужный город/категории/лимит.
+Правь блок CONFIG ниже: LIMIT и список городов/публику в CONFIG_LISTING.
 Офлайн-проверка логики:  %run sympla_colab.py --selftest
 """
 
@@ -48,8 +49,8 @@ def _load_api_key():
 
 
 # ======================= CONFIG для Colab — правь тут =======================
-LIMIT = 20            # сколько событий собрать за прогон
-# Город/категории задаются в CONFIG_LISTING ниже (city_slug, categories).
+LIMIT = 100           # сколько событий собрать за прогон
+# Города и публику правь в CONFIG_LISTING ниже (cities, publics).
 # ===========================================================================
 
 
@@ -72,14 +73,15 @@ SOON_WINDOW_HOURS = 48           # «скоро начнётся», если с�
 LLM_MODEL = "claude-haiku-4-5"   # дёшево для классификации; уточнить актуальный id в docs.claude.com
 DEFAULT_LANG = "pt-BR"
 
-# TODO[live]: подтвердить реальный механизм листинга, открыв категорию в браузере
-# с Network-табом — почти наверняка страница дёргает внутренний JSON-эндпоинт.
-# Дёргать его стабильнее, чем парсить HTML-карточки.
+# Discovery идёт через search-API discovery-bff (подтверждён живой инспекцией).
 CONFIG_LISTING = {
-    "city": "São Paulo",
+    # Несколько городов одним прогоном (тот же детско-семейный фильтр publics).
+    # Порядок = приоритет набора; дедуп по url между городами.
+    "cities": ["São Paulo", "Rio de Janeiro", "Belo Horizonte", "Curitiba",
+               "Porto Alegre", "Brasília", "Campinas"],
     "publics": "97,220",   # фильтр аудитории в discovery-bff = детские/семейные
     "limit": 24,           # размер страницы search-API
-    "max_pages": 15,       # страховка от бесконечной пагинации
+    "max_pages": 15,       # страховка от бесконечной пагинации на город
 }
 
 # Search-API афиши Sympla (discovery-bff поверх krakend). Найден живой инспекцией
@@ -139,7 +141,11 @@ class Fact:
 # ----------------------------------------------------------------------------- 
 # Стадия 1 — discovery
 # ----------------------------------------------------------------------------- 
-def _search_params(page: int) -> dict:
+def _cities() -> list[str]:
+    return CONFIG_LISTING.get("cities") or [CONFIG_LISTING.get("city", "São Paulo")]
+
+
+def _search_params(page: int, city: str) -> dict:
     return {
         "service": "/v4/search/query",
         "publics": CONFIG_LISTING["publics"],
@@ -147,17 +153,17 @@ def _search_params(page: int) -> dict:
         "sort": "location-score",
         "type": "normal",
         "filter_sold_out": 1,
-        "city": CONFIG_LISTING["city"],
-        "location": CONFIG_LISTING["city"],
+        "city": city,
+        "location": city,
         "limit": CONFIG_LISTING["limit"],
         "page": page,
     }
 
 
-def _search_page(page: int) -> dict:
-    """Одна страница search-API. Бросает requests/ValueError при сетевой/JSON-ошибке."""
+def _search_page(page: int, city: str) -> dict:
+    """Одна страница search-API по городу. Бросает requests/ValueError при ошибке."""
     time.sleep(REQUEST_DELAY_SEC)
-    r = _session.get(SEARCH_API, params=_search_params(page), timeout=REQUEST_TIMEOUT,
+    r = _session.get(SEARCH_API, params=_search_params(page, city), timeout=REQUEST_TIMEOUT,
                      headers={"Accept": "application/json",
                               "Referer": "https://www.sympla.com.br/"})
     r.raise_for_status()
@@ -165,29 +171,32 @@ def _search_page(page: int) -> dict:
 
 
 def search_events(limit: int = 100) -> list[dict]:
-    """Сырые элементы событий из search-API Sympla (дедуп по url, с пагинацией)."""
+    """Сырые элементы событий из search-API по списку городов (дедуп по url)."""
     out: list[dict] = []
     seen: set[str] = set()
     max_pages = int(CONFIG_LISTING.get("max_pages", 15))
     page_size = int(CONFIG_LISTING.get("limit", 24))
-    page = 1
-    while len(out) < limit and page <= max_pages:
-        try:
-            data = _search_page(page)
-        except (requests.RequestException, ValueError):
+    for city in _cities():
+        if len(out) >= limit:
             break
-        items = data.get("data") or []
-        if not items:
-            break
-        for it in items:
-            u = it.get("url")
-            if u and u not in seen:
-                seen.add(u)
-                out.append(it)
-        total = data.get("total")
-        if total is not None and page * data.get("limit", page_size) >= total:
-            break  # все результаты выбраны
-        page += 1
+        page = 1
+        while len(out) < limit and page <= max_pages:
+            try:
+                data = _search_page(page, city)
+            except (requests.RequestException, ValueError):
+                break  # город недоступен — к следующему
+            items = data.get("data") or []
+            if not items:
+                break
+            for it in items:
+                u = it.get("url")
+                if u and u not in seen:
+                    seen.add(u)
+                    out.append(it)
+            total = data.get("total")
+            if total is not None and page * data.get("limit", page_size) >= total:
+                break  # все результаты этого города выбраны
+            page += 1
     return out[:limit]
 
 
@@ -954,7 +963,7 @@ def _colab_main():
     key = _load_api_key()
     use_llm = bool(key)
     print("LLM-классификация:", "ВКЛ (Haiku)" if use_llm else "ВЫКЛ — нет ANTHROPIC_API_KEY")
-    print(f"Город: {CONFIG_LISTING['city']} | publics: {CONFIG_LISTING['publics']}")
+    print(f"Города: {CONFIG_LISTING['cities']} | publics: {CONFIG_LISTING['publics']}")
     print("Сбор событий через search-API Sympla (discovery-bff)...")
     summary = run(limit=LIMIT, use_llm=use_llm, check_url=True)  # сам ходит в search-API
     print("\nГотово. Файл:", summary.get("out"))

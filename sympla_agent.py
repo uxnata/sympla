@@ -36,14 +36,15 @@ SOON_WINDOW_HOURS = 48           # «скоро начнётся», если с�
 LLM_MODEL = "claude-haiku-4-5"   # дёшево для классификации; уточнить актуальный id в docs.claude.com
 DEFAULT_LANG = "pt-BR"
 
-# TODO[live]: подтвердить реальный механизм листинга, открыв категорию в браузере
-# с Network-табом — почти наверняка страница дёргает внутренний JSON-эндпоинт.
-# Дёргать его стабильнее, чем парсить HTML-карточки.
+# Discovery идёт через search-API discovery-bff (подтверждён живой инспекцией).
 CONFIG_LISTING = {
-    "city": "São Paulo",
+    # Несколько городов одним прогоном (тот же детско-семейный фильтр publics).
+    # Порядок = приоритет набора; дедуп по url между городами.
+    "cities": ["São Paulo", "Rio de Janeiro", "Belo Horizonte", "Curitiba",
+               "Porto Alegre", "Brasília", "Campinas"],
     "publics": "97,220",   # фильтр аудитории в discovery-bff = детские/семейные
     "limit": 24,           # размер страницы search-API
-    "max_pages": 15,       # страховка от бесконечной пагинации
+    "max_pages": 15,       # страховка от бесконечной пагинации на город
 }
 
 # Search-API афиши Sympla (discovery-bff поверх krakend). Найден живой инспекцией
@@ -103,7 +104,11 @@ class Fact:
 # ----------------------------------------------------------------------------- 
 # Стадия 1 — discovery
 # ----------------------------------------------------------------------------- 
-def _search_params(page: int) -> dict:
+def _cities() -> list[str]:
+    return CONFIG_LISTING.get("cities") or [CONFIG_LISTING.get("city", "São Paulo")]
+
+
+def _search_params(page: int, city: str) -> dict:
     return {
         "service": "/v4/search/query",
         "publics": CONFIG_LISTING["publics"],
@@ -111,17 +116,17 @@ def _search_params(page: int) -> dict:
         "sort": "location-score",
         "type": "normal",
         "filter_sold_out": 1,
-        "city": CONFIG_LISTING["city"],
-        "location": CONFIG_LISTING["city"],
+        "city": city,
+        "location": city,
         "limit": CONFIG_LISTING["limit"],
         "page": page,
     }
 
 
-def _search_page(page: int) -> dict:
-    """Одна страница search-API. Бросает requests/ValueError при сетевой/JSON-ошибке."""
+def _search_page(page: int, city: str) -> dict:
+    """Одна страница search-API по городу. Бросает requests/ValueError при ошибке."""
     time.sleep(REQUEST_DELAY_SEC)
-    r = _session.get(SEARCH_API, params=_search_params(page), timeout=REQUEST_TIMEOUT,
+    r = _session.get(SEARCH_API, params=_search_params(page, city), timeout=REQUEST_TIMEOUT,
                      headers={"Accept": "application/json",
                               "Referer": "https://www.sympla.com.br/"})
     r.raise_for_status()
@@ -129,29 +134,32 @@ def _search_page(page: int) -> dict:
 
 
 def search_events(limit: int = 100) -> list[dict]:
-    """Сырые элементы событий из search-API Sympla (дедуп по url, с пагинацией)."""
+    """Сырые элементы событий из search-API по списку городов (дедуп по url)."""
     out: list[dict] = []
     seen: set[str] = set()
     max_pages = int(CONFIG_LISTING.get("max_pages", 15))
     page_size = int(CONFIG_LISTING.get("limit", 24))
-    page = 1
-    while len(out) < limit and page <= max_pages:
-        try:
-            data = _search_page(page)
-        except (requests.RequestException, ValueError):
+    for city in _cities():
+        if len(out) >= limit:
             break
-        items = data.get("data") or []
-        if not items:
-            break
-        for it in items:
-            u = it.get("url")
-            if u and u not in seen:
-                seen.add(u)
-                out.append(it)
-        total = data.get("total")
-        if total is not None and page * data.get("limit", page_size) >= total:
-            break  # все результаты выбраны
-        page += 1
+        page = 1
+        while len(out) < limit and page <= max_pages:
+            try:
+                data = _search_page(page, city)
+            except (requests.RequestException, ValueError):
+                break  # город недоступен — к следующему
+            items = data.get("data") or []
+            if not items:
+                break
+            for it in items:
+                u = it.get("url")
+                if u and u not in seen:
+                    seen.add(u)
+                    out.append(it)
+            total = data.get("total")
+            if total is not None and page * data.get("limit", page_size) >= total:
+                break  # все результаты этого города выбраны
+            page += 1
     return out[:limit]
 
 
