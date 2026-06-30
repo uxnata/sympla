@@ -40,18 +40,19 @@ DEFAULT_LANG = "pt-BR"
 # с Network-табом — почти наверняка страница дёргает внутренний JSON-эндпоинт.
 # Дёргать его стабильнее, чем парсить HTML-карточки.
 CONFIG_LISTING = {
-    "base": "https://www.sympla.com.br",
     "city": "São Paulo",
-    "city_slug": "sao-paulo-sp",  # сегмент города в URL афиши Sympla
-    "categories": ["infantil", "teatros-e-espetaculos", "cursos-e-workshops"],
-    "max_pages": 10,              # страховка от бесконечной пагинации
-    # "endpoint": "https://www.sympla.com.br/api/.../search?...",  # <- заполнить с живого сайта
+    "publics": "97,220",   # фильтр аудитории в discovery-bff = детские/семейные
+    "limit": 24,           # размер страницы search-API
+    "max_pages": 15,       # страховка от бесконечной пагинации
 }
 
-# Паттерн страницы события Sympla. Историчные формы:
-#   /evento/<slug>/<id>   и   /<slug>__<id>
-# Ловим обе и отсекаем служебные/листинговые ссылки.
-_EVENT_HREF_RE = re.compile(r"sympla\.com\.br/(?:evento/[^?#]+|[^/?#]+__\d+)", re.I)
+# Search-API афиши Sympla (discovery-bff поверх krakend). Найден живой инспекцией
+# Network-таба: GET, отдаёт {"data":[{...}], "total":N, "limit":L, "page":P}.
+# Каждый элемент несёт url/name/start_date_formats/location — этого хватает на
+# базовый факт даже без захода на страницу события.
+SEARCH_API = "https://www.sympla.com.br/api/discovery-bff/search/category-type"
+_SEARCH_ONLY = ("name,start_date,end_date,images,event_type,duration_type,location,"
+                "id,global_score,start_date_formats,end_date_formats,url,company,type,organizer")
 
 # BFF-эндпоинт со списком билетов (цены). Найден живой инспекцией Network-таба:
 # GET, отдаёт {"tickets":[...], "groups":[{"tickets":[...], "subgroups":[...]}]}.
@@ -102,67 +103,100 @@ class Fact:
 # ----------------------------------------------------------------------------- 
 # Стадия 1 — discovery
 # ----------------------------------------------------------------------------- 
-def _listing_url(category: str, page: int) -> str:
-    base = CONFIG_LISTING["base"].rstrip("/")
-    city = CONFIG_LISTING["city_slug"]
-    url = f"{base}/eventos/{city}/{category}"
-    return f"{url}?page={page}" if page > 1 else url
+def _search_params(page: int) -> dict:
+    return {
+        "service": "/v4/search/query",
+        "publics": CONFIG_LISTING["publics"],
+        "only": _SEARCH_ONLY,
+        "sort": "location-score",
+        "type": "normal",
+        "filter_sold_out": 1,
+        "city": CONFIG_LISTING["city"],
+        "location": CONFIG_LISTING["city"],
+        "limit": CONFIG_LISTING["limit"],
+        "page": page,
+    }
 
 
-def _extract_event_links(html_text: str) -> list[str]:
-    """Вытащить абсолютные URL страниц событий из HTML листинга (детерминированно).
+def _search_page(page: int) -> dict:
+    """Одна страница search-API. Бросает requests/ValueError при сетевой/JSON-ошибке."""
+    time.sleep(REQUEST_DELAY_SEC)
+    r = _session.get(SEARCH_API, params=_search_params(page), timeout=REQUEST_TIMEOUT,
+                     headers={"Accept": "application/json",
+                              "Referer": "https://www.sympla.com.br/"})
+    r.raise_for_status()
+    return r.json()
 
-    Чистый парсинг — отделён от сети, чтобы покрывался оффлайн-тестом фикстурой.
-    """
-    soup = BeautifulSoup(html_text, "html.parser")
-    out: list[str] = []
+
+def search_events(limit: int = 100) -> list[dict]:
+    """Сырые элементы событий из search-API Sympla (дедуп по url, с пагинацией)."""
+    out: list[dict] = []
     seen: set[str] = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.startswith("/"):
-            href = CONFIG_LISTING["base"].rstrip("/") + href
-        if not _EVENT_HREF_RE.search(href):
-            continue
-        clean = href.split("#")[0].split("?")[0]   # убрать utm/якоря, чтобы дедуп работал
-        if clean not in seen:
-            seen.add(clean)
-            out.append(clean)
-    return out
+    max_pages = int(CONFIG_LISTING.get("max_pages", 15))
+    page_size = int(CONFIG_LISTING.get("limit", 24))
+    page = 1
+    while len(out) < limit and page <= max_pages:
+        try:
+            data = _search_page(page)
+        except (requests.RequestException, ValueError):
+            break
+        items = data.get("data") or []
+        if not items:
+            break
+        for it in items:
+            u = it.get("url")
+            if u and u not in seen:
+                seen.add(u)
+                out.append(it)
+        total = data.get("total")
+        if total is not None and page * data.get("limit", page_size) >= total:
+            break  # все результаты выбраны
+        page += 1
+    return out[:limit]
 
 
 def discover_event_urls(limit: int = 100) -> list[str]:
-    """Собрать до `limit` URL событий из категорий Sympla по городу (HTML-листинг + пагинация).
+    """Список URL событий по городу через search-API (обёртка над search_events)."""
+    return [it["url"] for it in search_events(limit) if it.get("url")]
 
-    Стратегия B (HTML-листинг) реализована и детерминирована: ходим по
-    /eventos/<город>/<категория>?page=N, тащим ссылки событий, пагинируем пока
-    страница приносит что-то новое и не превышен max_pages/limit.
 
-    TODO[live]: egress к sympla.com.br в этой среде закрыт политикой прокси (403),
-    поэтому точную форму URL листинга и наличие внутреннего JSON-эндпоинта
-    (стратегия A, надёжнее) нельзя подтвердить вживую. Когда доступ появится:
-      1) открыть категорию Infantil, во вкладке Network найти search-эндпоинт;
-      2) при расхождении поправить _listing_url()/_EVENT_HREF_RE по факту.
-    Парсер ссылок (_extract_event_links) от формы листинга не зависит и покрыт тестом.
-    """
-    found: list[str] = []
-    seen: set[str] = set()
-    max_pages = int(CONFIG_LISTING.get("max_pages", 10))
-    for category in CONFIG_LISTING["categories"]:
-        for page in range(1, max_pages + 1):
-            if len(found) >= limit:
-                return found[:limit]
-            try:
-                html_text = fetch_html(_listing_url(category, page))
-            except requests.RequestException:
-                break  # категория недоступна — переходим к следующей
-            links = _extract_event_links(html_text)
-            fresh = [u for u in links if u not in seen]
-            if not fresh:
-                break  # пустая/повторная страница — конец пагинации этой категории
-            for u in fresh:
-                seen.add(u)
-                found.append(u)
-    return found[:limit]
+# Месяцы pt-BR из start_date_formats.pt (там УЖЕ локальное время, в отличие от UTC start_date)
+_PT_MONTHS = {"jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+              "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12}
+
+
+def _parse_pt_datetime(s: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """'Qui, 02 Jul - 2026 · 16:15' -> ('2026-07-02', '16:15'). Иначе (None, None)."""
+    m = re.search(r"(\d{1,2})\s+([A-Za-zçÇ]{3})\s*-\s*(\d{4}).*?(\d{2}:\d{2})", s or "")
+    if not m:
+        return None, None
+    day, mon, year, hhmm = m.groups()
+    mm = _PT_MONTHS.get(mon[:3].lower())
+    if not mm:
+        return None, None
+    return f"{year}-{mm:02d}-{int(day):02d}", hhmm
+
+
+def fact_from_search(item: dict) -> Fact:
+    """Базовый факт из элемента search-ответа (источник для bileto-событий и затравка
+    для остальных). Время берём из *_date_formats.pt — оно локальное (UTC-3)."""
+    f = Fact(source_url=item.get("url"))
+    f.title = _clean(item.get("name"))
+    f.start_date, f.start_time = _parse_pt_datetime((item.get("start_date_formats") or {}).get("pt"))
+    f.end_date, f.end_time = _parse_pt_datetime((item.get("end_date_formats") or {}).get("pt"))
+
+    loc = item.get("location") or {}
+    if isinstance(loc, dict) and loc:
+        street, num = loc.get("address"), loc.get("address_num")
+        line = f"{street}, {num}" if street and num and str(num) != "0" else street
+        city_state = " - ".join(p for p in [loc.get("city"), loc.get("state")] if p)
+        parts = [loc.get("name"), line, loc.get("neighborhood"), city_state]
+        f.address = ", ".join(p for p in parts if p) or None
+        f.city = _clean(loc.get("city"))
+        f.district = _clean(loc.get("neighborhood")) or None
+
+    f.format = "online" if str(item.get("event_type", "")).upper() == "ONLINE" else "offline"
+    return f
 
 
 # ----------------------------------------------------------------------------- 
@@ -531,39 +565,55 @@ def _url_ok(url: str) -> bool:
 # ----------------------------------------------------------------------------- 
 # Orchestration
 # ----------------------------------------------------------------------------- 
+_IS_EVENT_PAGE = "sympla.com.br/evento/"   # только такие страницы парсятся (__NEXT_DATA__/цена)
+
+
 def process_one(url: str, use_llm: bool = True, check_url: bool = True,
-                fetch_prices: bool = True) -> Fact:
+                fetch_prices: bool = True, base: Optional[Fact] = None) -> Fact:
     html_text = fetch_html(url)
     price = None
-    if fetch_prices:                       # цена живёт в отдельном BFF-эндпоинте
+    if fetch_prices and _IS_EVENT_PAGE in (url or ""):   # цена живёт в отдельном BFF-эндпоинте
         eid = _event_id_from_url(url)
         if eid:
             price = fetch_ticket_prices(eid)
-    return process_html(html_text, url, use_llm=use_llm, check_url=check_url, price=price)
+    return process_html(html_text, url, use_llm=use_llm, check_url=check_url, price=price, base=base)
+
+
+def _merge_fill(f: Fact, base: Fact) -> None:
+    """Заполнить пустые поля f данными из base (search-ответ). f всегда в приоритете."""
+    for k in ("title", "description", "start_date", "start_time", "end_date", "end_time",
+              "address", "city", "district", "format", "price", "is_free"):
+        if getattr(f, k) is None and getattr(base, k) is not None:
+            setattr(f, k, getattr(base, k))
 
 
 def process_html(html_text: str, url: str, use_llm: bool = True, check_url: bool = True,
-                 price: Optional[float] = None) -> Fact:
+                 price: Optional[float] = None, base: Optional[Fact] = None) -> Fact:
     """Стадии 2..5 над уже скачанным HTML (вынесено ради оффлайн-тестов).
 
     Источники по приоритету: JSON-LD (schema.org) -> __NEXT_DATA__ (основной для
-    Sympla) -> OpenGraph/meta-фоллбэк дозабирает оставшиеся пустые поля.
-    `price` (если передан из ticket-эндпоинта) идёт в нормализацию -> is_free.
+    Sympla) -> OpenGraph/meta-фоллбэк -> base из search-ответа дозабирает остаток.
+    `price` (из ticket-эндпоинта) идёт в нормализацию -> is_free.
     """
     events = extract_jsonld_events(html_text)
     if events:
         f = parse_event(events[0], url)
     else:
         f = parse_next_data(html_text, url) or Fact(source_url=url)
-    # HTML-фоллбэк всегда дозабирает пустые поля
+    # HTML-фоллбэк дозабирает пустые поля из мета-тегов
     f = parse_html_fallback(html_text, url, base=f)
+    if f.price is None and price is not None:   # цена из ticket-эндпоинта
+        f.price = price
+    # search-данные (base) — затравка/единственный источник для bileto-страниц
+    if base is not None:
+        _merge_fill(f, base)
+        if base.status == "отменено":
+            f.status = "отменено"
     if not f.title:
-        # ни JSON-LD, ни __NEXT_DATA__, ни мета — нечего классифицировать
+        # ни JSON-LD, ни __NEXT_DATA__, ни мета, ни search — нечего классифицировать
         f.status = "требует проверки"
         f._issues.append("no_data")
         return f
-    if f.price is None and price is not None:   # цена из ticket-эндпоинта
-        f.price = price
     f.category = _map_category(f)
     enrich = enrich_with_llm(f) if use_llm else {}
     f = normalize(f, enrich)
@@ -571,19 +621,29 @@ def process_html(html_text: str, url: str, use_llm: bool = True, check_url: bool
     return f
 
 
-def run(urls: Optional[list[str]] = None, limit: int = 100, out_path: str = "facts.json") -> dict:
-    urls = urls or discover_event_urls(limit)
-    urls = urls[:limit]
+def run(urls: Optional[list[str]] = None, limit: int = 100, out_path: str = "facts.json",
+        use_llm: bool = True, check_url: bool = True, fetch_prices: bool = True) -> dict:
+    # urls задан вручную -> элементы без search-данных; иначе тянем search (с базовым фактом)
+    items = ([{"url": u} for u in urls[:limit]] if urls is not None
+             else search_events(limit))
     facts: list[dict] = []
-    for i, url in enumerate(urls, 1):
+    for i, item in enumerate(items, 1):
+        url = item.get("url")
         try:
-            f = process_one(url)
-        except Exception as e:           # один битый URL не должен ронять прогон
+            base = fact_from_search(item) if item.get("name") else None
+            if url and _IS_EVENT_PAGE in url:
+                f = process_one(url, use_llm=use_llm, check_url=check_url,
+                                fetch_prices=fetch_prices, base=base)
+            elif url:                       # bileto/прочее: страница не парсится -> только search
+                f = process_html("", url, use_llm=use_llm, check_url=check_url, base=base)
+            else:
+                raise ValueError("no_url")
+        except Exception as e:              # один битый URL не должен ронять прогон
             f = Fact(source_url=url, status="требует проверки")
             f._issues.append(f"error:{type(e).__name__}")
         rec = {k: v for k, v in asdict(f).items() if not k.startswith("_")}
         facts.append(rec)
-        print(f"[{i}/{len(urls)}] {f.status:16} {f.title or url}")
+        print(f"[{i}/{len(items)}] {f.status:16} {f.title or url}")
     clean = sum(1 for x in facts if x["status"] != "требует проверки")
     with open(out_path, "w", encoding="utf-8") as fp:
         json.dump(facts, fp, ensure_ascii=False, indent=2)
@@ -709,13 +769,18 @@ _FIXTURE_PARTIAL = """<html><head>
  "startDate":"2026-08-01","location":{"@type":"Place","name":"SESC"}}
 </script></head><body><p>Entrada: Gratuito. Vagas limitadas.</p></body></html>"""
 
-_FIXTURE_LISTING = """<html><body>
-<a href="/evento/o-pequeno-principe/1234567">card</a>
-<a href="https://www.sympla.com.br/teatro-infantil__2222?utm_source=x">card</a>
-<a href="/evento/o-pequeno-principe/1234567#hero">dup</a>
-<a href="/eventos/sao-paulo-sp/infantil">not-an-event</a>
-<a href="https://outrosite.com/evento/abc/9">other-domain</a>
-</body></html>"""
+# Элемент search-ответа discovery-bff (форма с живого API) — bileto-событие:
+# страница не парсится, факт собирается прямо из search-данных.
+_FIXTURE_SEARCH_ITEM = {
+    "url": "https://bileto.sympla.com.br/event/66711",
+    "name": "Chapeuzinho Vermelho e o Lobo ",
+    "event_type": "NORMAL",
+    "start_date": "2026-06-21T19:15:00+00:00",   # UTC — НЕ берём напрямую
+    "start_date_formats": {"pt": "Dom, 21 Jun - 2026 · 16:15"},  # локальное время
+    "end_date_formats": {"pt": "Dom, 26 Jul - 2026 · 16:15"},
+    "location": {"name": "Teatro Bibi Ferreira", "address": "Av. Brigadeiro Luiz Antônio, 931",
+                 "address_num": "0", "neighborhood": "", "city": "São Paulo", "state": "SP"},
+}
 
 # Sympla-страница: JSON-LD нет, всё в __NEXT_DATA__ (как на реальном сайте)
 _FIXTURE_NEXT = """<html><head>
@@ -809,12 +874,20 @@ def selftest() -> int:
     check(_event_id_from_url("https://www.sympla.com.br/evento/x/3426870") == "3426870", "eid1")
     check(_event_id_from_url("https://www.sympla.com.br/teatro-infantil__2222") == "2222", "eid2")
 
-    # 4) discovery-парсер ссылок: дедуп, абсолютизация, отсев чужого домена/листинга
-    links = _extract_event_links(_FIXTURE_LISTING)
-    check(links == [
-        "https://www.sympla.com.br/evento/o-pequeno-principe/1234567",
-        "https://www.sympla.com.br/teatro-infantil__2222",
-    ], f"links={links}")
+    # 4) search-API: факт из элемента ответа (локальное время из *_formats.pt, адрес)
+    check(_parse_pt_datetime("Dom, 21 Jun - 2026 · 16:15") == ("2026-06-21", "16:15"),
+          f"pt_dt={_parse_pt_datetime('Dom, 21 Jun - 2026 · 16:15')}")
+    fs = fact_from_search(_FIXTURE_SEARCH_ITEM)
+    check(fs.title == "Chapeuzinho Vermelho e o Lobo", f"search title={fs.title!r}")
+    check(fs.start_date == "2026-06-21" and fs.start_time == "16:15", f"search dt={fs.start_date} {fs.start_time}")
+    check(fs.city == "São Paulo" and fs.district is None, f"search city/distr={fs.city}/{fs.district}")
+    check(fs.address == "Teatro Bibi Ferreira, Av. Brigadeiro Luiz Antônio, 931, São Paulo - SP",
+          f"search addr={fs.address}")  # address_num '0' опущен
+    # 4b) bileto-событие через run-путь: страница не парсится -> факт целиком из base
+    fb = process_html("", _FIXTURE_SEARCH_ITEM["url"], use_llm=False, check_url=False, base=fs)
+    check(fb.title == "Chapeuzinho Vermelho e o Lobo" and fb.start_date == "2026-06-21",
+          f"bileto merge={fb.title!r}/{fb.start_date}")
+    check("missing:start_date" not in fb._issues, f"bileto issues={fb._issues}")
 
     # 5) статусы: прошло / скоро / отменено / нет даты
     past = normalize(Fact(title="t", source_url="u", start_date="2020-01-01"), {}, today=today)

@@ -38,23 +38,31 @@ status ∈ {новое, актуальное, скоро начнётся, пр�
 - **Нормализация:** city, district, is_free, category, format, currency.
 - **Дериватив (LLM/правило):** age_category, language, suitable_for_children/parents, status, updated_at.
 
-## Состояние реализации
-- `discover_event_urls()` — **реализован** (стратегия B: HTML-листинг
-  `/eventos/<город>/<категория>?page=N` + пагинация + дедуп). Чистый парсер ссылок
-  `_extract_event_links()` отделён от сети и покрыт self-test'ом.
-- `parse_html_fallback()` — **реализован**, вызывается в `process_html()`: дозабирает
-  пустые поля из OpenGraph/Twitter/`<meta>` + явную бесплатность («Gratuito/Grátis»).
-  Даты/адрес из произвольного текста НЕ выдумываются → нет данных → «требует проверки».
-- Оффлайн self-test: `python3 sympla_agent.py --selftest` (6 групп проверок, без сети/LLM).
+## Состояние реализации (источники подтверждены живой инспекцией Sympla)
+Sympla — Next.js/SPA: JSON-LD на страницах НЕТ, листинг рендерится клиентом.
+Поэтому факты берём из трёх реальных эндпоинтов/встроенного JSON:
+- **Discovery — `search_events()` / `discover_event_urls()`**: search-API
+  `GET /api/discovery-bff/search/category-type?publics=97,220&city=São Paulo&page=N`
+  → `{"data":[…],"total","limit","page"}`. Пагинация по `page`, дедуп по `url`.
+  `fact_from_search()` строит базовый факт прямо из ответа (name, дата из
+  `*_date_formats.pt` — она локальная, в отличие от UTC `start_date`; адрес/город/район).
+- **Страница события — `parse_next_data()`**: `<script id="__NEXT_DATA__">`,
+  путь `props.pageProps.hydrationData.eventHydration.event` (title, detail, start/end
+  ISO8601, `eventsAddress`, `onlineInfo`, `cancelled`). Только для `*/evento/*`.
+- **Цена — `fetch_ticket_prices()`**: `GET event-page.svc.sympla.com.br/api/event-bff/
+  purchase/event/{id}/tickets` → min `salePriceMonetary.decimal` среди видимых билетов.
+  Цены нет в HTML, поэтому отдельный запрос; нет данных → `price/is_free=null`.
+- `bileto.sympla.com.br/event/*` — другой хостинг, страница не парсится: факт целиком
+  из search-данных (`run()` так и делает, `_merge_fill`).
+- **HTML-фоллбэк** (`parse_html_fallback`) дозабирает пустое из OpenGraph/meta.
+- Оффлайн self-test: `python3 sympla_agent.py --selftest` (на фикстурах реальных
+  ответов; без сети/LLM) — держать зелёным.
 
-## Что доделать (TODO[live] — требует живого доступа к sympla.com.br)
-> В текущей облачной среде egress к `sympla.com.br` закрыт политикой прокси (HTTP 403 на
-> CONNECT), поэтому пункты ниже нельзя подтвердить вживую. Делать там, где доступ открыт.
-1. Подтвердить форму URL листинга и наличие внутреннего JSON-эндпоинта (стратегия A,
-   надёжнее HTML): открыть категорию Infantil, Network-таб → search-эндпоинт.
-   При расхождении поправить `_listing_url()` / `_EVENT_HREF_RE`.
-2. Добавить Sympla-специфичные CSS-селекторы даты/адреса/цены в `parse_html_fallback()`
-   для страниц с неполным JSON-LD.
+## Что доделать
+1. Подтвердить, что `publics=97,220` покрывает нужные детские/семейные категории
+   (при необходимости добавить значения/города в `CONFIG_LISTING`).
+2. При смене UA: ticket-API/`__NEXT_DATA__` могут отвечать иначе — следить за долей `null`.
+3. Дедуп между ежедневными прогонами (накопление базы без повторов по `source_url`).
 
 ## Правила валидации (стадия 5)
 - `source_url` отдаёт HTTP 200 (ловит выдумки/мёртвые ссылки).
