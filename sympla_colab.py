@@ -89,6 +89,11 @@ CONFIG_LISTING = {
 # Ловим обе и отсекаем служебные/листинговые ссылки.
 _EVENT_HREF_RE = re.compile(r"sympla\.com\.br/(?:evento/[^?#]+|[^/?#]+__\d+)", re.I)
 
+# BFF-эндпоинт со списком билетов (цены). Найден живой инспекцией Network-таба:
+# GET, отдаёт {"tickets":[...], "groups":[{"tickets":[...], "subgroups":[...]}]}.
+# Цены нет в самой странице (__NEXT_DATA__) — она грузится отдельным запросом.
+TICKETS_API = "https://event-page.svc.sympla.com.br/api/event-bff/purchase/event/{id}/tickets"
+
 # Маппинг таксономии Sympla -> внутренние категории (расширять по мере встречи новых)
 CATEGORY_MAP = {
     "infantil": "Детские события",
@@ -208,6 +213,27 @@ def fetch_html(url: str) -> str:
     r = _session.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.text
+
+
+def fetch_ticket_prices(event_id: str) -> Optional[float]:
+    """Минимальная цена билета события из BFF-эндпоинта Sympla. None — если нет данных.
+
+    Отдельный вежливый GET (цены нет в HTML). Любая сетевая/JSON-ошибка → None,
+    чтобы не ронять прогон и не выдумывать цену.
+    """
+    url = TICKETS_API.format(id=event_id)
+    try:
+        time.sleep(REQUEST_DELAY_SEC)
+        r = _session.get(url, timeout=REQUEST_TIMEOUT, headers={
+            "Accept": "application/json",
+            "Origin": "https://www.sympla.com.br",
+            "Referer": "https://www.sympla.com.br/",
+        })
+        if r.status_code != 200:
+            return None
+        return _min_ticket_price(r.json())
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def extract_jsonld_events(html_text: str) -> list[dict]:
@@ -541,16 +567,24 @@ def _url_ok(url: str) -> bool:
 # ----------------------------------------------------------------------------- 
 # Orchestration
 # ----------------------------------------------------------------------------- 
-def process_one(url: str, use_llm: bool = True, check_url: bool = True) -> Fact:
+def process_one(url: str, use_llm: bool = True, check_url: bool = True,
+                fetch_prices: bool = True) -> Fact:
     html_text = fetch_html(url)
-    return process_html(html_text, url, use_llm=use_llm, check_url=check_url)
+    price = None
+    if fetch_prices:                       # цена живёт в отдельном BFF-эндпоинте
+        eid = _event_id_from_url(url)
+        if eid:
+            price = fetch_ticket_prices(eid)
+    return process_html(html_text, url, use_llm=use_llm, check_url=check_url, price=price)
 
 
-def process_html(html_text: str, url: str, use_llm: bool = True, check_url: bool = True) -> Fact:
+def process_html(html_text: str, url: str, use_llm: bool = True, check_url: bool = True,
+                 price: Optional[float] = None) -> Fact:
     """Стадии 2..5 над уже скачанным HTML (вынесено ради оффлайн-тестов).
 
     Источники по приоритету: JSON-LD (schema.org) -> __NEXT_DATA__ (основной для
     Sympla) -> OpenGraph/meta-фоллбэк дозабирает оставшиеся пустые поля.
+    `price` (если передан из ticket-эндпоинта) идёт в нормализацию -> is_free.
     """
     events = extract_jsonld_events(html_text)
     if events:
@@ -564,6 +598,8 @@ def process_html(html_text: str, url: str, use_llm: bool = True, check_url: bool
         f.status = "требует проверки"
         f._issues.append("no_data")
         return f
+    if f.price is None and price is not None:   # цена из ticket-эндпоинта
+        f.price = price
     f.category = _map_category(f)
     enrich = enrich_with_llm(f) if use_llm else {}
     f = normalize(f, enrich)
@@ -653,6 +689,33 @@ def _safe_json(text: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError:
         return {}
+
+def _event_id_from_url(url: str) -> Optional[str]:
+    """Числовой id события из URL Sympla ('/evento/<slug>/3426870' или '<slug>__2222')."""
+    m = re.search(r"(\d+)\D*$", url or "")
+    return m.group(1) if m else None
+
+def _collect_tickets(node) -> list[dict]:
+    """Собрать все билеты из ответа BFF (tickets + groups[].tickets + subgroups[])."""
+    out: list[dict] = []
+    if isinstance(node, dict):
+        out += [t for t in (node.get("tickets") or []) if isinstance(t, dict)]
+        for key in ("groups", "subgroups"):
+            for child in node.get(key) or []:
+                out += _collect_tickets(child)
+    return out
+
+def _min_ticket_price(data: dict) -> Optional[float]:
+    """Минимальная цена продажи среди видимых билетов. None — если цен нет."""
+    prices = []
+    for t in _collect_tickets(data):
+        if t.get("show") is False:
+            continue
+        sp = t.get("salePriceMonetary") or {}
+        p = sp.get("decimal")
+        if isinstance(p, (int, float)):
+            prices.append(float(p))
+    return min(prices) if prices else None
 
 
 # -----------------------------------------------------------------------------
@@ -759,6 +822,29 @@ def selftest() -> int:
                       "https://www.sympla.com.br/evento/colonia/3426870",
                       use_llm=False, check_url=False)
     check(fc.status == "отменено", f"next cancelled={fc.status}")
+
+    # 3d) парсер цен ticket-эндпоинта: min среди видимых билетов (форма реального ответа)
+    ticket_json = {"tickets": [], "groups": [{"groupId": "1", "tickets": [
+        {"salePriceMonetary": {"decimal": 287, "integer": 28700}, "isFree": False, "show": True},
+        {"salePriceMonetary": {"decimal": 150.5, "integer": 15050}, "show": True},
+        {"salePriceMonetary": {"decimal": 10, "integer": 1000}, "show": False},  # скрытый — игнор
+    ], "subgroups": [{"tickets": [
+        {"salePriceMonetary": {"decimal": 99.9, "integer": 9990}, "show": True},
+    ]}]}]}
+    check(_min_ticket_price(ticket_json) == 99.9, f"minprice={_min_ticket_price(ticket_json)}")
+    check(_min_ticket_price({"tickets": [], "groups": []}) is None, "minprice empty -> None")
+
+    # 3e) цена из ticket-эндпоинта пробрасывается в нормализацию -> is_free
+    fp = process_html(_FIXTURE_NEXT, "https://www.sympla.com.br/evento/colonia/3426870",
+                      use_llm=False, check_url=False, price=287.0)
+    check(fp.price == 287.0 and fp.is_free is False, f"price inject={fp.price}/{fp.is_free}")
+    ff = process_html(_FIXTURE_NEXT, "https://www.sympla.com.br/evento/colonia/3426870",
+                      use_llm=False, check_url=False, price=0.0)
+    check(ff.is_free is True, f"free inject={ff.is_free}")
+
+    # 3f) event id из URL
+    check(_event_id_from_url("https://www.sympla.com.br/evento/x/3426870") == "3426870", "eid1")
+    check(_event_id_from_url("https://www.sympla.com.br/teatro-infantil__2222") == "2222", "eid2")
 
     # 4) discovery-парсер ссылок: дедуп, абсолютизация, отсев чужого домена/листинга
     links = _extract_event_links(_FIXTURE_LISTING)
